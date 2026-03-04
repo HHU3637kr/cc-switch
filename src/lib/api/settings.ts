@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Settings, WebDavSyncSettings, RemoteSnapshotInfo } from "@/types";
+import type { Settings, WebDavSyncSettings, GitHubSyncSettings, RemoteSnapshotInfo } from "@/types";
 import type { AppId } from "./types";
 
 export interface ConfigTransferResult {
@@ -136,6 +136,42 @@ export const settingsApi = {
     RemoteSnapshotInfo | { empty: true }
   > {
     return await invoke("webdav_sync_fetch_remote_info");
+  },
+
+  // ─── GitHub sync ────────────────────────────────────────────
+
+  async githubTestConnection(
+    settings: GitHubSyncSettings,
+    preserveEmptyToken = true,
+  ): Promise<WebDavTestResult> {
+    return await invoke("github_test_connection", {
+      settings,
+      preserveEmptyToken,
+    });
+  },
+
+  async githubSyncUpload(): Promise<WebDavSyncResult> {
+    return await invoke("github_sync_upload");
+  },
+
+  async githubSyncDownload(): Promise<WebDavSyncResult> {
+    return await invoke("github_sync_download");
+  },
+
+  async githubSyncSaveSettings(
+    settings: GitHubSyncSettings,
+    tokenTouched = false,
+  ): Promise<{ success: boolean }> {
+    return await invoke("github_sync_save_settings", {
+      settings,
+      tokenTouched,
+    });
+  },
+
+  async githubSyncFetchRemoteInfo(): Promise<
+    RemoteSnapshotInfo | { empty: true }
+  > {
+    return await invoke("github_sync_fetch_remote_info");
   },
 
   async syncCurrentProvidersLive(): Promise<void> {

@@ -52,6 +52,29 @@ export const settingsSchema = z.object({
         .optional(),
     })
     .optional(),
+
+  // GitHub 同步设置（通过专用命令保存，schema 仅用于读取）
+  githubSync: z
+    .object({
+      enabled: z.boolean().optional(),
+      autoSync: z.boolean().optional(),
+      token: z.string().optional(),
+      repo: z.string().trim().optional().or(z.literal("")),
+      branch: z.string().trim().optional().or(z.literal("")),
+      remoteRoot: z.string().trim().optional().or(z.literal("")),
+      profile: z.string().trim().optional().or(z.literal("")),
+      status: z
+        .object({
+          lastSyncAt: z.number().nullable().optional(),
+          lastError: z.string().nullable().optional(),
+          lastErrorSource: z.string().nullable().optional(),
+          lastLocalManifestHash: z.string().nullable().optional(),
+          lastRemoteManifestHash: z.string().nullable().optional(),
+          lastManifestBlobSha: z.string().nullable().optional(),
+        })
+        .optional(),
+    })
+    .optional(),
 });
 
 export type SettingsFormData = z.infer<typeof settingsSchema>;

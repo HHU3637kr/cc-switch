@@ -1,7 +1,8 @@
-//! WebDAV v2 sync protocol layer.
+//! GitHub v2 sync protocol layer.
 //!
 //! Implements manifest-based synchronization on top of the HTTP transport
-//! primitives in [`super::webdav`]. Artifact set: `db.sql` + `skills.zip`.
+//! primitives in [`super::github`]. Shares the same artifact set and manifest
+//! format as [`super::webdav_sync`]: `db.sql` + `skills.zip`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -16,14 +17,11 @@ use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 
 use crate::error::AppError;
-use crate::services::webdav::{
-    auth_from_credentials, build_remote_url, ensure_remote_directories, get_bytes, head_etag,
-    path_segments, put_bytes, test_connection, WebDavAuth,
-};
-use crate::settings::{update_webdav_sync_status, WebDavSyncSettings, WebDavSyncStatus};
+use crate::services::github::{get_file, head_file_sha, put_file, test_connection};
+use crate::settings::{update_github_sync_status, GitHubSyncSettings, GitHubSyncStatus};
 
-pub(crate) mod archive;
-use archive::{
+// Reuse the archive module from webdav_sync (skills zip/unzip)
+use crate::services::webdav_sync::archive::{
     backup_current_skills, restore_skills_from_backup, restore_skills_zip, zip_skills_ssot,
 };
 
@@ -32,11 +30,10 @@ use archive::{
 const PROTOCOL_FORMAT: &str = "cc-switch-webdav-sync";
 const PROTOCOL_VERSION: u32 = 2;
 const REMOTE_DB_SQL: &str = "db.sql";
-pub(crate) const REMOTE_SKILLS_ZIP: &str = "skills.zip";
+const REMOTE_SKILLS_ZIP: &str = "skills.zip";
 const REMOTE_MANIFEST: &str = "manifest.json";
 const MAX_DEVICE_NAME_LEN: usize = 64;
-const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
-pub(crate) const MAX_SYNC_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+pub(super) const MAX_SYNC_ARTIFACT_BYTES: u64 = 100 * 1024 * 1024; // 100 MB (GitHub limit)
 
 pub fn sync_mutex() -> &'static tokio::sync::Mutex<()> {
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
@@ -51,11 +48,11 @@ where
     operation.await
 }
 
-pub(crate) fn localized(key: &'static str, zh: impl Into<String>, en: impl Into<String>) -> AppError {
+fn localized(key: &'static str, zh: impl Into<String>, en: impl Into<String>) -> AppError {
     AppError::localized(key, zh, en)
 }
 
-pub(crate) fn io_context_localized(
+fn io_context_localized(
     _key: &'static str,
     zh: impl Into<String>,
     en: impl Into<String>,
@@ -95,60 +92,68 @@ struct LocalSnapshot {
     manifest_hash: String,
 }
 
-// ─── Public API ──────────────────────────────────────────────
-
-/// Check WebDAV connectivity and ensure remote directory structure.
-pub async fn check_connection(settings: &WebDavSyncSettings) -> Result<(), AppError> {
-    settings.validate()?;
-    let auth = auth_for(settings);
-    test_connection(&settings.base_url, &auth).await?;
-    let dir_segs = remote_dir_segments(settings);
-    ensure_remote_directories(&settings.base_url, &dir_segs, &auth).await?;
-    Ok(())
+/// Tracks blob SHAs for remote files (needed to update existing files).
+struct RemoteShas {
+    db_sql: Option<String>,
+    skills_zip: Option<String>,
+    manifest: Option<String>,
 }
 
-/// Upload local snapshot (db + skills) to remote.
+// ─── Public API ──────────────────────────────────────────────
+
+/// Check GitHub connectivity and verify repo/branch access.
+pub async fn check_connection(settings: &GitHubSyncSettings) -> Result<(), AppError> {
+    settings.validate()?;
+    test_connection(settings).await
+}
+
+/// Upload local snapshot (db + skills) to GitHub.
 pub async fn upload(
     db: &crate::database::Database,
-    settings: &mut WebDavSyncSettings,
+    settings: &mut GitHubSyncSettings,
 ) -> Result<Value, AppError> {
     settings.validate()?;
-    let auth = auth_for(settings);
-    let dir_segs = remote_dir_segments(settings);
-    ensure_remote_directories(&settings.base_url, &dir_segs, &auth).await?;
 
-    let snapshot = build_local_snapshot(db, settings)?;
+    let snapshot = build_local_snapshot(db)?;
+
+    // Fetch existing blob SHAs for update operations
+    let remote_shas = fetch_remote_shas(settings).await?;
 
     // Upload order: artifacts first, manifest last (best-effort consistency)
-    let db_url = remote_file_url(settings, REMOTE_DB_SQL)?;
-    put_bytes(&db_url, &auth, snapshot.db_sql, "application/sql").await?;
-
-    let skills_url = remote_file_url(settings, REMOTE_SKILLS_ZIP)?;
-    put_bytes(&skills_url, &auth, snapshot.skills_zip, "application/zip").await?;
-
-    let manifest_url = remote_file_url(settings, REMOTE_MANIFEST)?;
-    put_bytes(
-        &manifest_url,
-        &auth,
-        snapshot.manifest_bytes,
-        "application/json",
+    let db_path = remote_file_path(settings, REMOTE_DB_SQL);
+    let _db_sha = put_file(
+        settings,
+        &db_path,
+        &snapshot.db_sql,
+        remote_shas.db_sql.as_deref(),
+        "sync: update db.sql",
     )
     .await?;
 
-    // Fetch etag (best-effort, don't fail the upload)
-    let etag = match head_etag(&manifest_url, &auth).await {
-        Ok(e) => e,
-        Err(e) => {
-            log::debug!("[WebDAV] Failed to fetch ETag after upload: {e}");
-            None
-        }
-    };
+    let skills_path = remote_file_path(settings, REMOTE_SKILLS_ZIP);
+    let _skills_sha = put_file(
+        settings,
+        &skills_path,
+        &snapshot.skills_zip,
+        remote_shas.skills_zip.as_deref(),
+        "sync: update skills.zip",
+    )
+    .await?;
+
+    let manifest_path = remote_file_path(settings, REMOTE_MANIFEST);
+    let manifest_blob_sha = put_file(
+        settings,
+        &manifest_path,
+        &snapshot.manifest_bytes,
+        remote_shas.manifest.as_deref(),
+        "sync: update manifest.json",
+    )
+    .await?;
 
     let _persisted = persist_sync_success_best_effort(
         settings,
         snapshot.manifest_hash,
-        etag,
-        persist_sync_success,
+        Some(manifest_blob_sha),
     );
     Ok(serde_json::json!({ "status": "uploaded" }))
 }
@@ -156,24 +161,23 @@ pub async fn upload(
 /// Download remote snapshot and apply to local database + skills.
 pub async fn download(
     db: &crate::database::Database,
-    settings: &mut WebDavSyncSettings,
+    settings: &mut GitHubSyncSettings,
 ) -> Result<Value, AppError> {
     settings.validate()?;
-    let auth = auth_for(settings);
 
-    let manifest_url = remote_file_url(settings, REMOTE_MANIFEST)?;
-    let (manifest_bytes, etag) = get_bytes(&manifest_url, &auth, MAX_MANIFEST_BYTES)
+    let manifest_path = remote_file_path(settings, REMOTE_MANIFEST);
+    let manifest_file = get_file(settings, &manifest_path)
         .await?
         .ok_or_else(|| {
             localized(
-                "webdav.sync.remote_empty",
+                "github.sync.remote_empty",
                 "远端没有可下载的同步数据",
-                "No downloadable sync data found on the remote.",
+                "No downloadable sync data found on GitHub.",
             )
         })?;
 
     let manifest: SyncManifest =
-        serde_json::from_slice(&manifest_bytes).map_err(|e| AppError::Json {
+        serde_json::from_slice(&manifest_file.content).map_err(|e| AppError::Json {
             path: REMOTE_MANIFEST.to_string(),
             source: e,
         })?;
@@ -181,33 +185,36 @@ pub async fn download(
     validate_manifest_compat(&manifest)?;
 
     // Download and verify artifacts
-    let db_sql = download_and_verify(settings, &auth, REMOTE_DB_SQL, &manifest.artifacts).await?;
+    let db_sql = download_and_verify(settings, REMOTE_DB_SQL, &manifest.artifacts).await?;
     let skills_zip =
-        download_and_verify(settings, &auth, REMOTE_SKILLS_ZIP, &manifest.artifacts).await?;
+        download_and_verify(settings, REMOTE_SKILLS_ZIP, &manifest.artifacts).await?;
 
     // Apply snapshot
     apply_snapshot(db, &db_sql, &skills_zip)?;
 
-    let manifest_hash = sha256_hex(&manifest_bytes);
-    let _persisted =
-        persist_sync_success_best_effort(settings, manifest_hash, etag, persist_sync_success);
+    let manifest_hash = sha256_hex(&manifest_file.content);
+    let _persisted = persist_sync_success_best_effort(
+        settings,
+        manifest_hash,
+        Some(manifest_file.sha),
+    );
     Ok(serde_json::json!({ "status": "downloaded" }))
 }
 
 /// Fetch remote manifest info without downloading artifacts.
-pub async fn fetch_remote_info(settings: &WebDavSyncSettings) -> Result<Option<Value>, AppError> {
+pub async fn fetch_remote_info(settings: &GitHubSyncSettings) -> Result<Option<Value>, AppError> {
     settings.validate()?;
-    let auth = auth_for(settings);
-    let manifest_url = remote_file_url(settings, REMOTE_MANIFEST)?;
+    let manifest_path = remote_file_path(settings, REMOTE_MANIFEST);
 
-    let Some((bytes, _)) = get_bytes(&manifest_url, &auth, MAX_MANIFEST_BYTES).await? else {
+    let Some(file) = get_file(settings, &manifest_path).await? else {
         return Ok(None);
     };
 
-    let manifest: SyncManifest = serde_json::from_slice(&bytes).map_err(|e| AppError::Json {
-        path: REMOTE_MANIFEST.to_string(),
-        source: e,
-    })?;
+    let manifest: SyncManifest =
+        serde_json::from_slice(&file.content).map_err(|e| AppError::Json {
+            path: REMOTE_MANIFEST.to_string(),
+            source: e,
+        })?;
 
     let compatible = validate_manifest_compat(&manifest).is_ok();
 
@@ -223,38 +230,34 @@ pub async fn fetch_remote_info(settings: &WebDavSyncSettings) -> Result<Option<V
     Ok(Some(payload))
 }
 
-// ─── Sync status persistence (I3: deduplicated) ─────────────
+// ─── Sync status persistence ─────────────────────────────────
 
 fn persist_sync_success(
-    settings: &mut WebDavSyncSettings,
+    settings: &mut GitHubSyncSettings,
     manifest_hash: String,
-    etag: Option<String>,
+    manifest_blob_sha: Option<String>,
 ) -> Result<(), AppError> {
-    let status = WebDavSyncStatus {
+    let status = GitHubSyncStatus {
         last_sync_at: Some(Utc::now().timestamp()),
         last_error: None,
         last_error_source: None,
         last_local_manifest_hash: Some(manifest_hash.clone()),
         last_remote_manifest_hash: Some(manifest_hash),
-        last_remote_etag: etag,
+        last_manifest_blob_sha: manifest_blob_sha,
     };
     settings.status = status.clone();
-    update_webdav_sync_status(status)
+    update_github_sync_status(status)
 }
 
-fn persist_sync_success_best_effort<F>(
-    settings: &mut WebDavSyncSettings,
+fn persist_sync_success_best_effort(
+    settings: &mut GitHubSyncSettings,
     manifest_hash: String,
-    etag: Option<String>,
-    persist_fn: F,
-) -> bool
-where
-    F: FnOnce(&mut WebDavSyncSettings, String, Option<String>) -> Result<(), AppError>,
-{
-    match persist_fn(settings, manifest_hash, etag) {
+    manifest_blob_sha: Option<String>,
+) -> bool {
+    match persist_sync_success(settings, manifest_hash, manifest_blob_sha) {
         Ok(()) => true,
         Err(err) => {
-            log::warn!("[WebDAV] Persist sync status failed, keep operation success: {err}");
+            log::warn!("[GitHub] Persist sync status failed, keep operation success: {err}");
             false
         }
     }
@@ -262,10 +265,7 @@ where
 
 // ─── Snapshot building ───────────────────────────────────────
 
-fn build_local_snapshot(
-    db: &crate::database::Database,
-    _settings: &WebDavSyncSettings,
-) -> Result<LocalSnapshot, AppError> {
+fn build_local_snapshot(db: &crate::database::Database) -> Result<LocalSnapshot, AppError> {
     // Export database to SQL string
     let sql_string = db.export_sql_string()?;
     let db_sql = sql_string.into_bytes();
@@ -273,15 +273,19 @@ fn build_local_snapshot(
     // Pack skills into deterministic ZIP
     let tmp = tempdir().map_err(|e| {
         io_context_localized(
-            "webdav.sync.snapshot_tmpdir_failed",
-            "创建 WebDAV 快照临时目录失败",
-            "Failed to create temporary directory for WebDAV snapshot",
+            "github.sync.snapshot_tmpdir_failed",
+            "创建 GitHub 快照临时目录失败",
+            "Failed to create temporary directory for GitHub snapshot",
             e,
         )
     })?;
     let skills_zip_path = tmp.path().join(REMOTE_SKILLS_ZIP);
     zip_skills_ssot(&skills_zip_path)?;
     let skills_zip = fs::read(&skills_zip_path).map_err(|e| AppError::io(&skills_zip_path, e))?;
+
+    // Validate sizes against GitHub limits
+    validate_artifact_size_limit(REMOTE_DB_SQL, db_sql.len() as u64)?;
+    validate_artifact_size_limit(REMOTE_SKILLS_ZIP, skills_zip.len() as u64)?;
 
     // Build artifact map and compute hashes
     let mut artifacts = BTreeMap::new();
@@ -321,9 +325,6 @@ fn build_local_snapshot(
     })
 }
 
-/// Compute a deterministic snapshot identity from artifact hashes.
-///
-/// BTreeMap iteration order is sorted by key, ensuring stability.
 fn compute_snapshot_id(artifacts: &BTreeMap<String, ArtifactMeta>) -> String {
     let parts: Vec<String> = artifacts
         .iter()
@@ -387,7 +388,7 @@ fn normalize_device_name(raw: &str) -> Option<String> {
 fn validate_manifest_compat(manifest: &SyncManifest) -> Result<(), AppError> {
     if manifest.format != PROTOCOL_FORMAT {
         return Err(localized(
-            "webdav.sync.manifest_format_incompatible",
+            "github.sync.manifest_format_incompatible",
             format!("远端 manifest 格式不兼容: {}", manifest.format),
             format!(
                 "Remote manifest format is incompatible: {}",
@@ -397,7 +398,7 @@ fn validate_manifest_compat(manifest: &SyncManifest) -> Result<(), AppError> {
     }
     if manifest.version != PROTOCOL_VERSION {
         return Err(localized(
-            "webdav.sync.manifest_version_incompatible",
+            "github.sync.manifest_version_incompatible",
             format!(
                 "远端 manifest 协议版本不兼容: v{} (本地 v{PROTOCOL_VERSION})",
                 manifest.version
@@ -414,52 +415,49 @@ fn validate_manifest_compat(manifest: &SyncManifest) -> Result<(), AppError> {
 // ─── Download & verify ───────────────────────────────────────
 
 async fn download_and_verify(
-    settings: &WebDavSyncSettings,
-    auth: &WebDavAuth,
+    settings: &GitHubSyncSettings,
     artifact_name: &str,
     artifacts: &BTreeMap<String, ArtifactMeta>,
 ) -> Result<Vec<u8>, AppError> {
     let meta = artifacts.get(artifact_name).ok_or_else(|| {
         localized(
-            "webdav.sync.manifest_missing_artifact",
+            "github.sync.manifest_missing_artifact",
             format!("manifest 中缺少 artifact: {artifact_name}"),
             format!("Manifest missing artifact: {artifact_name}"),
         )
     })?;
     validate_artifact_size_limit(artifact_name, meta.size)?;
 
-    let url = remote_file_url(settings, artifact_name)?;
-    let (bytes, _) = get_bytes(&url, auth, MAX_SYNC_ARTIFACT_BYTES as usize)
-        .await?
-        .ok_or_else(|| {
-            localized(
-                "webdav.sync.remote_missing_artifact",
-                format!("远端缺少 artifact 文件: {artifact_name}"),
-                format!("Remote artifact file missing: {artifact_name}"),
-            )
-        })?;
+    let path = remote_file_path(settings, artifact_name);
+    let file = get_file(settings, &path).await?.ok_or_else(|| {
+        localized(
+            "github.sync.remote_missing_artifact",
+            format!("远端缺少 artifact 文件: {artifact_name}"),
+            format!("Remote artifact file missing: {artifact_name}"),
+        )
+    })?;
 
     // Quick size check before expensive hash
-    if bytes.len() as u64 != meta.size {
+    if file.content.len() as u64 != meta.size {
         return Err(localized(
-            "webdav.sync.artifact_size_mismatch",
+            "github.sync.artifact_size_mismatch",
             format!(
                 "artifact {artifact_name} 大小不匹配 (expected: {}, got: {})",
                 meta.size,
-                bytes.len(),
+                file.content.len(),
             ),
             format!(
                 "Artifact {artifact_name} size mismatch (expected: {}, got: {})",
                 meta.size,
-                bytes.len(),
+                file.content.len(),
             ),
         ));
     }
 
-    let actual_hash = sha256_hex(&bytes);
+    let actual_hash = sha256_hex(&file.content);
     if actual_hash != meta.sha256 {
         return Err(localized(
-            "webdav.sync.artifact_hash_mismatch",
+            "github.sync.artifact_hash_mismatch",
             format!(
                 "artifact {artifact_name} SHA256 校验失败 (expected: {}..., got: {}...)",
                 meta.sha256.get(..8).unwrap_or(&meta.sha256),
@@ -472,7 +470,7 @@ async fn download_and_verify(
             ),
         ));
     }
-    Ok(bytes)
+    Ok(file.content)
 }
 
 fn apply_snapshot(
@@ -482,20 +480,20 @@ fn apply_snapshot(
 ) -> Result<(), AppError> {
     let sql_str = std::str::from_utf8(db_sql).map_err(|e| {
         localized(
-            "webdav.sync.sql_not_utf8",
+            "github.sync.sql_not_utf8",
             format!("SQL 非 UTF-8: {e}"),
             format!("SQL is not valid UTF-8: {e}"),
         )
     })?;
     let skills_backup = backup_current_skills()?;
 
-    // 先替换 skills，再导入数据库；若导入失败则回滚 skills，避免“半恢复”。
+    // 先替换 skills，再导入数据库；若导入失败则回滚 skills，避免"半恢复"。
     restore_skills_zip(skills_zip)?;
 
     if let Err(db_err) = db.import_sql_string(sql_str) {
         if let Err(rollback_err) = restore_skills_from_backup(&skills_backup) {
             return Err(localized(
-                "webdav.sync.db_import_and_rollback_failed",
+                "github.sync.db_import_and_rollback_failed",
                 format!("导入数据库失败: {db_err}; 同时回滚 Skills 失败: {rollback_err}"),
                 format!(
                     "Database import failed: {db_err}; skills rollback also failed: {rollback_err}"
@@ -510,32 +508,46 @@ fn apply_snapshot(
 
 // ─── Remote path helpers ─────────────────────────────────────
 
-fn remote_dir_segments(settings: &WebDavSyncSettings) -> Vec<String> {
-    let mut segs = Vec::new();
-    segs.extend(path_segments(&settings.remote_root).map(str::to_string));
-    segs.push(format!("v{PROTOCOL_VERSION}"));
-    segs.extend(path_segments(&settings.profile).map(str::to_string));
-    segs
+fn remote_file_path(settings: &GitHubSyncSettings, file_name: &str) -> String {
+    format!(
+        "{}/v{PROTOCOL_VERSION}/{}/{}",
+        settings.remote_root.trim_matches('/'),
+        settings.profile.trim_matches('/'),
+        file_name,
+    )
 }
 
-fn remote_file_url(settings: &WebDavSyncSettings, file_name: &str) -> Result<String, AppError> {
-    let mut segs = remote_dir_segments(settings);
-    segs.extend(path_segments(file_name).map(str::to_string));
-    build_remote_url(&settings.base_url, &segs)
-}
+/// Fetch existing blob SHAs for all artifacts (needed for PUT updates).
+async fn fetch_remote_shas(settings: &GitHubSyncSettings) -> Result<RemoteShas, AppError> {
+    let db_path = remote_file_path(settings, REMOTE_DB_SQL);
+    let skills_path = remote_file_path(settings, REMOTE_SKILLS_ZIP);
+    let manifest_path = remote_file_path(settings, REMOTE_MANIFEST);
 
-fn auth_for(settings: &WebDavSyncSettings) -> WebDavAuth {
-    auth_from_credentials(&settings.username, &settings.password)
+    // Execute all three HEAD requests concurrently
+    let (db_sha, skills_sha, manifest_sha) = tokio::try_join!(
+        head_file_sha(settings, &db_path),
+        head_file_sha(settings, &skills_path),
+        head_file_sha(settings, &manifest_path),
+    )?;
+
+    Ok(RemoteShas {
+        db_sql: db_sha,
+        skills_zip: skills_sha,
+        manifest: manifest_sha,
+    })
 }
 
 fn validate_artifact_size_limit(artifact_name: &str, size: u64) -> Result<(), AppError> {
     if size > MAX_SYNC_ARTIFACT_BYTES {
         let max_mb = MAX_SYNC_ARTIFACT_BYTES / 1024 / 1024;
         return Err(localized(
-            "webdav.sync.artifact_too_large",
-            format!("artifact {artifact_name} 超过下载上限（{} MB）", max_mb),
+            "github.sync.artifact_too_large",
             format!(
-                "Artifact {artifact_name} exceeds download limit ({} MB)",
+                "artifact {artifact_name} 超过 GitHub 上限（{} MB）",
+                max_mb
+            ),
+            format!(
+                "Artifact {artifact_name} exceeds GitHub limit ({} MB)",
                 max_mb
             ),
         ));
@@ -579,14 +591,14 @@ mod tests {
     }
 
     #[test]
-    fn remote_dir_segments_uses_v2() {
-        let settings = WebDavSyncSettings {
+    fn remote_file_path_builds_correctly() {
+        let settings = GitHubSyncSettings {
             remote_root: "cc-switch-sync".to_string(),
             profile: "default".to_string(),
-            ..WebDavSyncSettings::default()
+            ..GitHubSyncSettings::default()
         };
-        let segs = remote_dir_segments(&settings);
-        assert_eq!(segs, vec!["cc-switch-sync", "v2", "default"]);
+        let path = remote_file_path(&settings, "manifest.json");
+        assert_eq!(path, "cc-switch-sync/v2/default/manifest.json");
     }
 
     #[test]
@@ -598,30 +610,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn persist_best_effort_returns_true_on_success() {
-        let mut settings = WebDavSyncSettings::default();
-        let ok = persist_sync_success_best_effort(
-            &mut settings,
-            "hash".to_string(),
-            Some("etag".to_string()),
-            |_settings, _hash, _etag| Ok(()),
-        );
-        assert!(ok);
-    }
-
-    #[test]
-    fn persist_best_effort_returns_false_on_error() {
-        let mut settings = WebDavSyncSettings::default();
-        let ok = persist_sync_success_best_effort(
-            &mut settings,
-            "hash".to_string(),
-            None,
-            |_settings, _hash, _etag| Err(AppError::Config("boom".to_string())),
-        );
-        assert!(!ok);
-    }
-
     fn manifest_with(format: &str, version: u32) -> SyncManifest {
         let mut artifacts = BTreeMap::new();
         artifacts.insert("db.sql".to_string(), artifact("abc", 1));
@@ -629,8 +617,8 @@ mod tests {
         SyncManifest {
             format: format.to_string(),
             version,
-            device_name: "My MacBook".to_string(),
-            created_at: "2026-02-12T00:00:00Z".to_string(),
+            device_name: "My PC".to_string(),
+            created_at: "2026-03-04T00:00:00Z".to_string(),
             artifacts,
             snapshot_id: "snap-1".to_string(),
         }
@@ -655,44 +643,13 @@ mod tests {
     }
 
     #[test]
-    fn normalize_device_name_returns_none_for_blank_input() {
-        assert_eq!(normalize_device_name("   \n\t  "), None);
-    }
-
-    #[test]
-    fn normalize_device_name_collapses_whitespace_and_drops_control_chars() {
-        assert_eq!(
-            normalize_device_name("  Mac\tBook \n Pro\u{0007} "),
-            Some("Mac Book Pro".to_string())
-        );
-    }
-
-    #[test]
-    fn normalize_device_name_truncates_to_max_len() {
-        let long = "a".repeat(80);
-        assert_eq!(normalize_device_name(&long).map(|s| s.len()), Some(64));
-    }
-
-    #[test]
-    fn manifest_serialization_uses_device_name_only() {
-        let manifest = manifest_with(PROTOCOL_FORMAT, PROTOCOL_VERSION);
-        let value = serde_json::to_value(&manifest).expect("serialize manifest");
-        assert!(
-            value.get("deviceName").is_some(),
-            "manifest should contain deviceName"
-        );
-        assert!(
-            value.get("deviceId").is_none(),
-            "manifest should not contain deviceId"
-        );
-    }
-
-    #[test]
     fn validate_artifact_size_limit_rejects_oversized_artifacts() {
         let err = validate_artifact_size_limit("skills.zip", MAX_SYNC_ARTIFACT_BYTES + 1)
             .expect_err("artifact larger than limit should be rejected");
         assert!(
-            err.to_string().contains("too large") || err.to_string().contains("超过"),
+            err.to_string().contains("too large")
+                || err.to_string().contains("超过")
+                || err.to_string().contains("exceeds"),
             "unexpected error: {err}"
         );
     }

@@ -375,6 +375,52 @@ function App() {
     };
   }, [queryClient, t]);
 
+  // GitHub sync status event listener
+  useEffect(() => {
+    let unsubscribe: (() => void) | undefined;
+    let active = true;
+
+    const setupListener = async () => {
+      try {
+        const off = await listen(
+          "github-sync-status-updated",
+          async (event) => {
+            const payload = (event.payload ??
+              {}) as WebDavSyncStatusUpdatedPayload;
+            await queryClient.invalidateQueries({ queryKey: ["settings"] });
+
+            if (payload.source !== "auto" || payload.status !== "error") {
+              return;
+            }
+
+            toast.error(
+              t("settings.githubSync.autoSyncFailedToast", {
+                defaultValue: "Auto sync failed: {{error}}",
+                error: payload.error || t("common.unknown"),
+              }),
+            );
+          },
+        );
+        if (!active) {
+          off();
+          return;
+        }
+        unsubscribe = off;
+      } catch (error) {
+        console.error(
+          "[App] Failed to subscribe github-sync-status-updated event",
+          error,
+        );
+      }
+    };
+
+    void setupListener();
+    return () => {
+      active = false;
+      unsubscribe?.();
+    };
+  }, [queryClient, t]);
+
   useEffect(() => {
     const checkEnvOnStartup = async () => {
       try {

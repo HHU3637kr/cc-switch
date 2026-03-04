@@ -153,6 +153,18 @@ pub async fn webdav_sync_save_settings(
         sync_settings.status = existing_settings.status;
     }
 
+    // Mutual exclusion: if enabling WebDAV sync, disable GitHub sync
+    if sync_settings.enabled {
+        if let Some(mut github) = settings::get_github_sync_settings() {
+            if github.enabled {
+                github.enabled = false;
+                github.auto_sync = false;
+                settings::set_github_sync_settings(Some(github)).map_err(|e| e.to_string())?;
+                log::info!("[WebDAV] Disabled GitHub sync due to mutual exclusion");
+            }
+        }
+    }
+
     sync_settings.normalize();
     sync_settings.validate().map_err(|e| e.to_string())?;
     settings::set_webdav_sync_settings(Some(sync_settings)).map_err(|e| e.to_string())?;

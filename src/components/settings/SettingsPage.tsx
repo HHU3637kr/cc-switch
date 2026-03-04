@@ -36,6 +36,7 @@ import { DirectorySettings } from "@/components/settings/DirectorySettings";
 import { ImportExportSection } from "@/components/settings/ImportExportSection";
 import { BackupListSection } from "@/components/settings/BackupListSection";
 import { WebdavSyncSection } from "@/components/settings/WebdavSyncSection";
+import { GitHubSyncSection } from "@/components/settings/GitHubSyncSection";
 import { AboutSection } from "@/components/settings/AboutSection";
 import { ProxyTabContent } from "@/components/settings/ProxyTabContent";
 // Hidden: stream check feature disabled
@@ -381,6 +382,8 @@ export function SettingsPage({
                         </AccordionTrigger>
                         <AccordionContent className="px-6 pb-6 pt-4 border-t border-border/50">
                           <WebdavSyncSection config={settings?.webdavSync} />
+                          <div className="my-6 border-t border-border/50" />
+                          <GitHubSyncSection config={settings?.githubSync} />
                         </AccordionContent>
                       </AccordionItem>
 

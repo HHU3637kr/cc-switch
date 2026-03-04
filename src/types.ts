@@ -187,6 +187,28 @@ export interface WebDavSyncSettings {
   status?: WebDavSyncStatus;
 }
 
+// GitHub 同步状态
+export interface GitHubSyncStatus {
+  lastSyncAt?: number | null;
+  lastError?: string | null;
+  lastErrorSource?: string | null;
+  lastLocalManifestHash?: string | null;
+  lastRemoteManifestHash?: string | null;
+  lastManifestBlobSha?: string | null;
+}
+
+// GitHub REST API 同步配置
+export interface GitHubSyncSettings {
+  enabled?: boolean;
+  autoSync?: boolean;
+  token?: string;
+  repo?: string;
+  branch?: string;
+  remoteRoot?: string;
+  profile?: string;
+  status?: GitHubSyncStatus;
+}
+
 // 远端快照信息（下载前预览）
 export interface RemoteSnapshotInfo {
   deviceName: string;
@@ -251,6 +273,9 @@ export interface Settings {
 
   // ===== WebDAV v2 同步设置 =====
   webdavSync?: WebDavSyncSettings;
+
+  // ===== GitHub 同步设置 =====
+  githubSync?: GitHubSyncSettings;
 
   // ===== 备份策略设置 =====
   // Auto-backup interval in hours (0=disabled, default 24)

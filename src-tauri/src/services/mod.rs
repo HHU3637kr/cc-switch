@@ -1,6 +1,8 @@
 pub mod config;
 pub mod env_checker;
 pub mod env_manager;
+pub mod github;
+pub mod github_sync;
 pub mod mcp;
 pub mod omo;
 pub mod prompt;

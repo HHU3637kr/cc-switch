@@ -943,6 +943,12 @@ pub fn run() {
             commands::webdav_sync_download,
             commands::webdav_sync_save_settings,
             commands::webdav_sync_fetch_remote_info,
+            // GitHub sync
+            commands::github_test_connection,
+            commands::github_sync_upload,
+            commands::github_sync_download,
+            commands::github_sync_save_settings,
+            commands::github_sync_fetch_remote_info,
             commands::save_file_dialog,
             commands::open_file_dialog,
             commands::open_zip_file_dialog,

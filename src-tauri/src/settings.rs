@@ -87,6 +87,122 @@ fn default_remote_root() -> String {
 fn default_profile() -> String {
     "default".to_string()
 }
+fn default_branch() -> String {
+    "main".to_string()
+}
+
+/// GitHub 同步状态（持久化同步进度信息）
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GitHubSyncStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_sync_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_local_manifest_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_remote_manifest_hash: Option<String>,
+    /// GitHub 文件的 blob SHA（用于更新文件时必须提供）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_manifest_blob_sha: Option<String>,
+}
+
+/// GitHub REST API 同步设置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitHubSyncSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub auto_sync: bool,
+    /// Personal Access Token (classic 或 fine-grained)
+    #[serde(default)]
+    pub token: String,
+    /// 仓库全名，格式 "owner/repo"
+    #[serde(default)]
+    pub repo: String,
+    /// 分支名，默认 "main"
+    #[serde(default = "default_branch")]
+    pub branch: String,
+    /// 远端根目录，默认 "cc-switch-sync"
+    #[serde(default = "default_remote_root")]
+    pub remote_root: String,
+    /// 配置档案名，默认 "default"
+    #[serde(default = "default_profile")]
+    pub profile: String,
+    /// 同步状态
+    #[serde(default)]
+    pub status: GitHubSyncStatus,
+}
+
+impl Default for GitHubSyncSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auto_sync: false,
+            token: String::new(),
+            repo: String::new(),
+            branch: default_branch(),
+            remote_root: default_remote_root(),
+            profile: default_profile(),
+            status: GitHubSyncStatus::default(),
+        }
+    }
+}
+
+impl GitHubSyncSettings {
+    pub fn validate(&self) -> Result<(), crate::error::AppError> {
+        if self.token.trim().is_empty() {
+            return Err(crate::error::AppError::localized(
+                "github.token.required",
+                "GitHub Token 不能为空",
+                "GitHub Token is required.",
+            ));
+        }
+        if self.repo.trim().is_empty() {
+            return Err(crate::error::AppError::localized(
+                "github.repo.required",
+                "GitHub 仓库名不能为空",
+                "GitHub repository name is required.",
+            ));
+        }
+        // Validate repo format: "owner/repo"
+        let parts: Vec<&str> = self.repo.trim().split('/').collect();
+        if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+            return Err(crate::error::AppError::localized(
+                "github.repo.invalid_format",
+                "仓库名格式无效，应为 \"owner/repo\"",
+                "Invalid repository format, expected \"owner/repo\".",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn normalize(&mut self) {
+        self.token = self.token.trim().to_string();
+        self.repo = self.repo.trim().to_string();
+        self.branch = self.branch.trim().to_string();
+        self.remote_root = self.remote_root.trim().to_string();
+        self.profile = self.profile.trim().to_string();
+        if self.branch.is_empty() {
+            self.branch = default_branch();
+        }
+        if self.remote_root.is_empty() {
+            self.remote_root = default_remote_root();
+        }
+        if self.profile.is_empty() {
+            self.profile = default_profile();
+        }
+    }
+
+    /// Returns true if all credential fields are blank (no config to persist).
+    fn is_empty(&self) -> bool {
+        self.token.is_empty() && self.repo.is_empty()
+    }
+}
 
 /// WebDAV v2 同步设置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -241,6 +357,10 @@ pub struct AppSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webdav_sync: Option<WebDavSyncSettings>,
 
+    // ===== GitHub 同步设置 =====
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_sync: Option<GitHubSyncSettings>,
+
     // ===== WebDAV 备份设置（旧版，保留向后兼容）=====
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webdav_backup: Option<serde_json::Value>,
@@ -296,6 +416,7 @@ impl Default for AppSettings {
             current_provider_openclaw: None,
             skill_sync_method: SyncMethod::default(),
             webdav_sync: None,
+            github_sync: None,
             webdav_backup: None,
             backup_interval_hours: None,
             backup_retain_count: None,
@@ -361,6 +482,13 @@ impl AppSettings {
             sync.normalize();
             if sync.is_empty() {
                 self.webdav_sync = None;
+            }
+        }
+
+        if let Some(sync) = &mut self.github_sync {
+            sync.normalize();
+            if sync.is_empty() {
+                self.github_sync = None;
             }
         }
     }
@@ -465,6 +593,9 @@ pub fn get_settings_for_frontend() -> AppSettings {
     let mut settings = get_settings();
     if let Some(sync) = &mut settings.webdav_sync {
         sync.password.clear();
+    }
+    if let Some(sync) = &mut settings.github_sync {
+        sync.token.clear();
     }
     settings.webdav_backup = None;
     settings
@@ -692,6 +823,29 @@ pub fn set_webdav_sync_settings(settings: Option<WebDavSyncSettings>) -> Result<
 pub fn update_webdav_sync_status(status: WebDavSyncStatus) -> Result<(), AppError> {
     mutate_settings(|current| {
         if let Some(sync) = current.webdav_sync.as_mut() {
+            sync.status = status;
+        }
+    })
+}
+
+// ===== GitHub 同步设置管理函数 =====
+
+/// 获取 GitHub 同步设置
+pub fn get_github_sync_settings() -> Option<GitHubSyncSettings> {
+    settings_store().read().ok()?.github_sync.clone()
+}
+
+/// 保存 GitHub 同步设置
+pub fn set_github_sync_settings(settings: Option<GitHubSyncSettings>) -> Result<(), AppError> {
+    mutate_settings(|current| {
+        current.github_sync = settings;
+    })
+}
+
+/// 仅更新 GitHub 同步状态，避免覆写 token/repo/branch 等字段
+pub fn update_github_sync_status(status: GitHubSyncStatus) -> Result<(), AppError> {
+    mutate_settings(|current| {
+        if let Some(sync) = current.github_sync.as_mut() {
             sync.status = status;
         }
     })

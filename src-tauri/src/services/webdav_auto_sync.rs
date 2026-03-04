@@ -9,8 +9,9 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 use crate::error::AppError;
+use crate::services::github_sync as github_sync_service;
 use crate::services::webdav_sync as webdav_sync_service;
-use crate::settings::{self, WebDavSyncSettings};
+use crate::settings::{self, GitHubSyncSettings, WebDavSyncSettings};
 
 const AUTO_SYNC_DEBOUNCE_MS: u64 = 1000;
 pub(crate) const MAX_AUTO_SYNC_WAIT_MS: u64 = 10_000;
@@ -79,13 +80,26 @@ fn should_run_auto_sync(settings: Option<&WebDavSyncSettings>) -> bool {
     sync.enabled && sync.auto_sync
 }
 
+fn should_run_github_auto_sync(settings: Option<&GitHubSyncSettings>) -> bool {
+    let Some(sync) = settings else {
+        return false;
+    };
+    sync.enabled && sync.auto_sync
+}
+
 fn persist_auto_sync_error(settings: &mut WebDavSyncSettings, error: &AppError) {
     settings.status.last_error = Some(error.to_string());
     settings.status.last_error_source = Some("auto".to_string());
     let _ = settings::update_webdav_sync_status(settings.status.clone());
 }
 
-fn emit_auto_sync_status_updated(app: &AppHandle, status: &str, error: Option<&str>) {
+fn persist_github_auto_sync_error(settings: &mut GitHubSyncSettings, error: &AppError) {
+    settings.status.last_error = Some(error.to_string());
+    settings.status.last_error_source = Some("auto".to_string());
+    let _ = settings::update_github_sync_status(settings.status.clone());
+}
+
+fn emit_auto_sync_status_updated(app: &AppHandle, event_name: &str, status: &str, error: Option<&str>) {
     let payload = match error {
         Some(message) => json!({
             "source": "auto",
@@ -98,8 +112,8 @@ fn emit_auto_sync_status_updated(app: &AppHandle, status: &str, error: Option<&s
         }),
     };
 
-    if let Err(err) = app.emit("webdav-sync-status-updated", payload) {
-        log::debug!("[WebDAV] failed to emit sync status update event: {err}");
+    if let Err(err) = app.emit(event_name, payload) {
+        log::debug!("[AutoSync] failed to emit sync status update event: {err}");
     }
 }
 
@@ -107,32 +121,59 @@ async fn run_auto_sync_upload(
     db: &crate::database::Database,
     app: &AppHandle,
 ) -> Result<(), AppError> {
-    let mut settings = settings::get_webdav_sync_settings();
-    if !should_run_auto_sync(settings.as_ref()) {
-        return Ok(());
+    // Check WebDAV first
+    let mut webdav_settings = settings::get_webdav_sync_settings();
+    if should_run_auto_sync(webdav_settings.as_ref()) {
+        let mut sync_settings = match webdav_settings.take() {
+            Some(value) => value,
+            None => return Ok(()),
+        };
+
+        let result = webdav_sync_service::run_with_sync_lock(webdav_sync_service::upload(
+            db,
+            &mut sync_settings,
+        ))
+        .await;
+        return match result {
+            Ok(_) => {
+                emit_auto_sync_status_updated(app, "webdav-sync-status-updated", "success", None);
+                Ok(())
+            }
+            Err(err) => {
+                persist_auto_sync_error(&mut sync_settings, &err);
+                emit_auto_sync_status_updated(app, "webdav-sync-status-updated", "error", Some(&err.to_string()));
+                Err(err)
+            }
+        };
     }
 
-    let mut sync_settings = match settings.take() {
-        Some(value) => value,
-        None => return Ok(()),
-    };
+    // Check GitHub
+    let mut github_settings = settings::get_github_sync_settings();
+    if should_run_github_auto_sync(github_settings.as_ref()) {
+        let mut sync_settings = match github_settings.take() {
+            Some(value) => value,
+            None => return Ok(()),
+        };
 
-    let result = webdav_sync_service::run_with_sync_lock(webdav_sync_service::upload(
-        db,
-        &mut sync_settings,
-    ))
-    .await;
-    match result {
-        Ok(_) => {
-            emit_auto_sync_status_updated(app, "success", None);
-            Ok(())
-        }
-        Err(err) => {
-            persist_auto_sync_error(&mut sync_settings, &err);
-            emit_auto_sync_status_updated(app, "error", Some(&err.to_string()));
-            Err(err)
-        }
+        let result = github_sync_service::run_with_sync_lock(github_sync_service::upload(
+            db,
+            &mut sync_settings,
+        ))
+        .await;
+        return match result {
+            Ok(_) => {
+                emit_auto_sync_status_updated(app, "github-sync-status-updated", "success", None);
+                Ok(())
+            }
+            Err(err) => {
+                persist_github_auto_sync_error(&mut sync_settings, &err);
+                emit_auto_sync_status_updated(app, "github-sync-status-updated", "error", Some(&err.to_string()));
+                Err(err)
+            }
+        };
     }
+
+    Ok(())
 }
 
 pub fn notify_db_changed(table: &str) {
